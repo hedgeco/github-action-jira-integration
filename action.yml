@@ -1,0 +1,184 @@
+name: 'Jira Integration Action'
+description: 'Integrates GitHub pull requests with Jira tickets for status updates and tracking'
+author: 'HedgeCo Vest'
+branding:
+  icon: 'link'
+  color: 'blue'
+
+inputs:
+  jira-base-url:
+    description: 'Base URL of your Jira instance (e.g., https://smartx.atlassian.net)'
+    required: true
+  jira-user-email:
+    description: 'Email address associated with your Jira API token'
+    required: true
+  jira-api-token:
+    description: 'Jira API token for authentication'
+    required: true
+  github-token:
+    description: 'GitHub token for authentication'
+    default: ${{ github.token }}
+    required: false
+  pr-open-transition:
+    description: 'Jira transition to trigger when PR is opened (name or ID)'
+    default: 'In Progress'
+    required: false
+  pr-merge-transition:
+    description: 'Jira transition to trigger when PR is merged (name or ID)'
+    default: 'Complete'
+    required: false
+  jira-project-key:
+    description: 'The key of the Jira project (e.g., INVEST, SMX)'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Extract Jira Issue Key
+      id: extract_jira_key
+      shell: bash
+      run: |
+        PR_TITLE="${{ github.event.pull_request.title }}"
+        PR_BRANCH="${{ github.event.pull_request.head.ref }}"
+        
+        # Extract the Jira issue key from either PR title or branch name
+        PROJECT_KEY="${{ inputs.jira-project-key }}"
+        
+        if [[ -z "$PROJECT_KEY" ]]; then
+          # Look for any pattern that resembles a Jira ticket (uppercase letters followed by numbers)
+          PATTERN="([A-Z]+-[0-9]+)"
+        else
+          # Look for the specific project key
+          PATTERN="($PROJECT_KEY-[0-9]+)"
+        fi
+        
+        if [[ "$PR_TITLE" =~ $PATTERN ]]; then
+          JIRA_ISSUE="${BASH_REMATCH[1]}"
+          echo "Found Jira issue key in PR title: $JIRA_ISSUE"
+          echo "JIRA_ISSUE=$JIRA_ISSUE" >> $GITHUB_ENV
+          echo "JIRA_ISSUE_FOUND=true" >> $GITHUB_ENV
+        elif [[ "$PR_BRANCH" =~ $PATTERN ]]; then
+          JIRA_ISSUE="${BASH_REMATCH[1]}"
+          echo "Found Jira issue key in branch name: $JIRA_ISSUE"
+          echo "JIRA_ISSUE=$JIRA_ISSUE" >> $GITHUB_ENV
+          echo "JIRA_ISSUE_FOUND=true" >> $GITHUB_ENV
+        else
+          echo "No Jira issue key found in PR title or branch name"
+          echo "JIRA_ISSUE_FOUND=false" >> $GITHUB_ENV
+        fi
+
+    - name: Add Jira Info to PR Description
+      if: env.JIRA_ISSUE_FOUND == 'true' && github.event.action != 'closed'
+      uses: cakeinpanic/jira-description-action@v0.4.0
+      with:
+        github-token: ${{ inputs.github-token }}
+        jira-token: ${{ inputs.jira-api-token }}
+        jira-base-url: ${{ inputs.jira-base-url }}
+        skip-branches: '^(main|master|dev|develop|release)$'
+        custom-issue-number-regexp: '([A-Z]+-[0-9]+)'
+
+    - name: Transition Jira Issue on PR Open
+      if: env.JIRA_ISSUE_FOUND == 'true' && github.event.action == 'opened'
+      shell: bash
+      run: |
+        JIRA_BASE_URL="${{ inputs.jira-base-url }}"
+        JIRA_EMAIL="${{ inputs.jira-user-email }}"
+        JIRA_TOKEN="${{ inputs.jira-api-token }}"
+        TRANSITION="${{ inputs.pr-open-transition }}"
+        
+        # Basic auth
+        AUTH=$(echo -n "${JIRA_EMAIL}:${JIRA_TOKEN}" | base64)
+        
+        # Get available transitions
+        TRANSITIONS_URL="${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/transitions"
+        TRANSITIONS=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${TRANSITIONS_URL}")
+        
+        # Find the requested transition ID if a name was provided
+        if [[ "$TRANSITION" =~ ^[0-9]+$ ]]; then
+          TRANSITION_ID="$TRANSITION"
+        else
+          # Extract transition ID from name
+          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name | test(\"$TRANSITION\"; \"i\")) | .id" | head -1)
+        fi
+        
+        if [[ -n "$TRANSITION_ID" ]]; then
+          echo "Transitioning ${JIRA_ISSUE} with transition ID: ${TRANSITION_ID}"
+          
+          # Perform the transition
+          curl -s -X POST \
+            -H "Authorization: Basic ${AUTH}" \
+            -H "Content-Type: application/json" \
+            --data "{\"transition\":{\"id\":\"${TRANSITION_ID}\"}}" \
+            "${TRANSITIONS_URL}"
+          
+          echo "✅ Jira issue ${JIRA_ISSUE} transitioned successfully"
+        else
+          echo "❌ Could not find transition ID for '$TRANSITION'"
+        fi
+
+    - name: Transition Jira Issue on PR Merge
+      if: env.JIRA_ISSUE_FOUND == 'true' && github.event.pull_request.merged == true
+      shell: bash
+      run: |
+        JIRA_BASE_URL="${{ inputs.jira-base-url }}"
+        JIRA_EMAIL="${{ inputs.jira-user-email }}"
+        JIRA_TOKEN="${{ inputs.jira-api-token }}"
+        TRANSITION="${{ inputs.pr-merge-transition }}"
+        
+        # Basic auth
+        AUTH=$(echo -n "${JIRA_EMAIL}:${JIRA_TOKEN}" | base64)
+        
+        # Get available transitions
+        TRANSITIONS_URL="${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/transitions"
+        TRANSITIONS=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${TRANSITIONS_URL}")
+        
+        # Find the requested transition ID if a name was provided
+        if [[ "$TRANSITION" =~ ^[0-9]+$ ]]; then
+          TRANSITION_ID="$TRANSITION"
+        else
+          # Extract transition ID from name
+          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name | test(\"$TRANSITION\"; \"i\")) | .id" | head -1)
+        fi
+        
+        if [[ -n "$TRANSITION_ID" ]]; then
+          echo "Transitioning ${JIRA_ISSUE} with transition ID: ${TRANSITION_ID}"
+          
+          # Add PR link in comment
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          COMMENT_DATA="{
+            \"body\": {
+              \"type\": \"doc\",
+              \"version\": 1,
+              \"content\": [
+                {
+                  \"type\": \"paragraph\",
+                  \"content\": [
+                    {
+                      \"type\": \"text\",
+                      \"text\": \"PR was merged: ${PR_URL}\"
+                    }
+                  ]
+                }
+              ]
+            }
+          }"
+          
+          # Add comment
+          curl -s -X POST \
+            -H "Authorization: Basic ${AUTH}" \
+            -H "Content-Type: application/json" \
+            --data "$COMMENT_DATA" \
+            "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/comment"
+          
+          # Perform the transition
+          curl -s -X POST \
+            -H "Authorization: Basic ${AUTH}" \
+            -H "Content-Type: application/json" \
+            --data "{\"transition\":{\"id\":\"${TRANSITION_ID}\"}}" \
+            "${TRANSITIONS_URL}"
+          
+          echo "✅ Jira issue ${JIRA_ISSUE} transitioned successfully"
+        else
+          echo "❌ Could not find transition ID for '$TRANSITION'"
+        fi
