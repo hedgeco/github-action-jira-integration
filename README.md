@@ -2,6 +2,8 @@
 
 This reusable GitHub Action automates the integration between GitHub pull requests and Jira issues.
 
+> **Note:** This action was tested with INVEST-2204 and works correctly.
+
 ## Features
 
 - 🔍 Automatically extracts Jira issue keys from PR titles or branch names
