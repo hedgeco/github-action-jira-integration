@@ -1,0 +1,18 @@
+name: Jira Integration
+
+on:
+  pull_request:
+    types: [opened, reopened, edited, closed]
+
+jobs:
+  jira-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: hedgeco/github-action-jira-integration@feature/INVEST-2204-integration-test
+        with:
+          jira-base-url: ${{ secrets.JIRA_BASE_URL }}
+          jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          pr-open-transition: 'In Progress'
+          pr-merge-transition: 'Complete'
+          jira-project-key: 'INVEST'
