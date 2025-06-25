@@ -8,7 +8,7 @@ jobs:
   jira-integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: hedgeco/github-action-jira-integration@feature/INVEST-2204-integration-test
+      - uses: hedgeco/github-action-jira-integration@master
         with:
           jira-base-url: ${{ secrets.JIRA_BASE_URL }}
           jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
