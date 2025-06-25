@@ -66,11 +66,10 @@ runs:
         else
           echo "No Jira issue key found in PR title or branch name"
           echo "JIRA_ISSUE_FOUND=false" >> $GITHUB_ENV
-        fi
-
-    - name: Add Jira Info to PR Description
+        fi    - name: Add Jira Info to PR Description
       if: env.JIRA_ISSUE_FOUND == 'true' && github.event.action != 'closed'
-      uses: cakeinpanic/jira-description-action@v0.4.0      with:
+      uses: cakeinpanic/jira-description-action@v0.4.0
+      with:
         github-token: ${{ inputs.github-token }}
         jira-token: ${{ inputs.jira-api-token }}
         jira-base-url: ${{ inputs.jira-base-url }}
