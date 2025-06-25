@@ -76,34 +76,103 @@ runs:
         jira-token: ${{ inputs.jira-api-token }}
         jira-base-url: ${{ inputs.jira-base-url }}
         skip-branches: '^(main|master|dev|develop|release)$'
-        custom-issue-number-regexp: '([A-Z]+-[0-9]+)'
-
-    - name: Transition Jira Issue on PR Open
+        custom-issue-number-regexp: '([A-Z]+-[0-9]+)'    - name: Transition Jira Issue on PR Open
       if: env.JIRA_ISSUE_FOUND == 'true' && github.event.action == 'opened'
       shell: bash
       run: |
         JIRA_BASE_URL="${{ inputs.jira-base-url }}"
         JIRA_EMAIL="${{ inputs.jira-user-email }}"
         JIRA_TOKEN="${{ inputs.jira-api-token }}"
-        TRANSITION="${{ inputs.pr-open-transition }}"
+        PREFERRED_TRANSITION="${{ inputs.pr-open-transition }}"
         
         # Basic auth
         AUTH=$(echo -n "${JIRA_EMAIL}:${JIRA_TOKEN}" | base64)
+        
+        # Get issue details
+        ISSUE_URL="${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}"
+        ISSUE_DATA=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${ISSUE_URL}")
+        
+        # Extract issue type and status
+        ISSUE_TYPE=$(echo "$ISSUE_DATA" | jq -r '.fields.issuetype.name')
+        CURRENT_STATUS=$(echo "$ISSUE_DATA" | jq -r '.fields.status.name')
+        
+        echo "Issue Type: $ISSUE_TYPE"
+        echo "Current Status: $CURRENT_STATUS"
+        
+        # If already "In Progress", no need to transition
+        if [[ "$CURRENT_STATUS" == "In Progress" || "$CURRENT_STATUS" == "Development" ]]; then
+          echo "Issue is already in '$CURRENT_STATUS' status. No transition needed."
+          exit 0
+        fi
         
         # Get available transitions
         TRANSITIONS_URL="${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/transitions"
         TRANSITIONS=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${TRANSITIONS_URL}")
         
-        # Find the requested transition ID if a name was provided
-        if [[ "$TRANSITION" =~ ^[0-9]+$ ]]; then
-          TRANSITION_ID="$TRANSITION"
-        else
-          # Extract transition ID from name
-          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name | test(\"$TRANSITION\"; \"i\")) | .id" | head -1)
-        fi
+        echo "Available transitions:"
+        echo "$TRANSITIONS" | jq -r '.transitions[] | "- \(.name) (ID: \(.id))"'
+        
+        # Try to find the best transition
+        # Priority order for transitions when PR is opened
+        TRANSITION_CANDIDATES=("$PREFERRED_TRANSITION" "In Progress" "Development" "Start Work" "Start Development")
+        
+        # Find the first available transition from our candidates
+        TRANSITION_ID=""
+        TRANSITION_NAME=""
+        
+        for TRANSITION_CANDIDATE in "${TRANSITION_CANDIDATES[@]}"; do
+          echo "Checking if '$TRANSITION_CANDIDATE' transition is available..."
+          
+          # Try exact match first
+          EXACT_MATCH=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name == \"$TRANSITION_CANDIDATE\") | .id")
+          
+          if [[ -n "$EXACT_MATCH" ]]; then
+            TRANSITION_ID="$EXACT_MATCH"
+            TRANSITION_NAME="$TRANSITION_CANDIDATE"
+            echo "Found exact match: $TRANSITION_NAME (ID: $TRANSITION_ID)"
+            break
+          fi
+          
+          # Try case-insensitive partial match
+          PARTIAL_MATCH=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name | ascii_downcase | contains(\"$(echo $TRANSITION_CANDIDATE | tr '[:upper:]' '[:lower:]')\")) | .id" | head -1)
+          
+          if [[ -n "$PARTIAL_MATCH" ]]; then
+            TRANSITION_ID="$PARTIAL_MATCH"
+            TRANSITION_NAME=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.id == \"$PARTIAL_MATCH\") | .name")
+            echo "Found partial match: $TRANSITION_NAME (ID: $TRANSITION_ID)"
+            break
+          fi
+        done
         
         if [[ -n "$TRANSITION_ID" ]]; then
-          echo "Transitioning ${JIRA_ISSUE} with transition ID: ${TRANSITION_ID}"
+          echo "Transitioning ${JIRA_ISSUE} with transition: ${TRANSITION_NAME} (ID: ${TRANSITION_ID})"
+          
+          # Add PR link in comment
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          COMMENT_DATA="{
+            \"body\": {
+              \"type\": \"doc\",
+              \"version\": 1,
+              \"content\": [
+                {
+                  \"type\": \"paragraph\",
+                  \"content\": [
+                    {
+                      \"type\": \"text\",
+                      \"text\": \"PR opened: ${PR_URL}\"
+                    }
+                  ]
+                }
+              ]
+            }
+          }"
+          
+          # Add comment
+          curl -s -X POST \
+            -H "Authorization: Basic ${AUTH}" \
+            -H "Content-Type: application/json" \
+            --data "$COMMENT_DATA" \
+            "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/comment"
           
           # Perform the transition
           curl -s -X POST \
@@ -112,37 +181,100 @@ runs:
             --data "{\"transition\":{\"id\":\"${TRANSITION_ID}\"}}" \
             "${TRANSITIONS_URL}"
           
-          echo "✅ Jira issue ${JIRA_ISSUE} transitioned successfully"
+          # Verify the transition
+          sleep 2 # Wait a moment for the transition to complete
+          UPDATED_ISSUE=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${ISSUE_URL}")
+          NEW_STATUS=$(echo "$UPDATED_ISSUE" | jq -r '.fields.status.name')
+          
+          if [[ "$NEW_STATUS" != "$CURRENT_STATUS" ]]; then
+            echo "✅ Jira issue ${JIRA_ISSUE} successfully transitioned from '$CURRENT_STATUS' to '$NEW_STATUS'"
+          else
+            echo "⚠️ Transition may have failed. Status is still '$CURRENT_STATUS'"
+          fi
         else
-          echo "❌ Could not find transition ID for '$TRANSITION'"
-        fi
-
-    - name: Transition Jira Issue on PR Merge
+          echo "❌ Could not find suitable transition for PR opening"
+        fi- name: Transition Jira Issue on PR Merge
       if: env.JIRA_ISSUE_FOUND == 'true' && github.event.pull_request.merged == true
       shell: bash
       run: |
         JIRA_BASE_URL="${{ inputs.jira-base-url }}"
         JIRA_EMAIL="${{ inputs.jira-user-email }}"
         JIRA_TOKEN="${{ inputs.jira-api-token }}"
-        TRANSITION="${{ inputs.pr-merge-transition }}"
+        PREFERRED_TRANSITION="${{ inputs.pr-merge-transition }}"
         
         # Basic auth
         AUTH=$(echo -n "${JIRA_EMAIL}:${JIRA_TOKEN}" | base64)
+        
+        echo "Getting Jira issue details for ${JIRA_ISSUE}..."
+        
+        # Get issue details to determine type and current status
+        ISSUE_URL="${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}"
+        ISSUE_DATA=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${ISSUE_URL}")
+        
+        # Extract issue type and status
+        ISSUE_TYPE=$(echo "$ISSUE_DATA" | jq -r '.fields.issuetype.name')
+        CURRENT_STATUS=$(echo "$ISSUE_DATA" | jq -r '.fields.status.name')
+        
+        echo "Issue Type: $ISSUE_TYPE"
+        echo "Current Status: $CURRENT_STATUS"
         
         # Get available transitions
         TRANSITIONS_URL="${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/transitions"
         TRANSITIONS=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${TRANSITIONS_URL}")
         
-        # Find the requested transition ID if a name was provided
-        if [[ "$TRANSITION" =~ ^[0-9]+$ ]]; then
-          TRANSITION_ID="$TRANSITION"
-        else
-          # Extract transition ID from name
-          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name | test(\"$TRANSITION\"; \"i\")) | .id" | head -1)
+        echo "Available transitions:"
+        echo "$TRANSITIONS" | jq -r '.transitions[] | "- \(.name) (ID: \(.id))"'
+        
+        # Try to find the best transition based on issue type and available transitions
+        # Priority order for transitions
+        TRANSITION_CANDIDATES=("$PREFERRED_TRANSITION" "Complete" "Done" "Ready for QA" "In Review" "Resolved")
+        
+        # Special transitions for certain issue types
+        if [[ "$ISSUE_TYPE" == "Story" || "$ISSUE_TYPE" == "Task" ]]; then
+          # Add story/task specific transitions if needed
+          TRANSITION_CANDIDATES+=("Ready for Testing" "Development Complete")
+        elif [[ "$ISSUE_TYPE" == "Bug" ]]; then
+          # Add bug specific transitions
+          TRANSITION_CANDIDATES+=("Fixed" "Verified")
+        fi
+        
+        # Find the first available transition from our candidates
+        TRANSITION_ID=""
+        TRANSITION_NAME=""
+        
+        for TRANSITION_CANDIDATE in "${TRANSITION_CANDIDATES[@]}"; do
+          echo "Checking if '$TRANSITION_CANDIDATE' transition is available..."
+          
+          # Try exact match first
+          EXACT_MATCH=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name == \"$TRANSITION_CANDIDATE\") | .id")
+          
+          if [[ -n "$EXACT_MATCH" ]]; then
+            TRANSITION_ID="$EXACT_MATCH"
+            TRANSITION_NAME="$TRANSITION_CANDIDATE"
+            echo "Found exact match: $TRANSITION_NAME (ID: $TRANSITION_ID)"
+            break
+          fi
+          
+          # Try case-insensitive partial match
+          PARTIAL_MATCH=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name | ascii_downcase | contains(\"$(echo $TRANSITION_CANDIDATE | tr '[:upper:]' '[:lower:]')\")) | .id" | head -1)
+          
+          if [[ -n "$PARTIAL_MATCH" ]]; then
+            TRANSITION_ID="$PARTIAL_MATCH"
+            TRANSITION_NAME=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.id == \"$PARTIAL_MATCH\") | .name")
+            echo "Found partial match: $TRANSITION_NAME (ID: $TRANSITION_ID)"
+            break
+          fi
+        done
+        
+        if [[ -z "$TRANSITION_ID" && -n "$TRANSITIONS" ]]; then
+          # If we still don't have a match, use the first available transition
+          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[0].id')
+          TRANSITION_NAME=$(echo "$TRANSITIONS" | jq -r '.transitions[0].name')
+          echo "No preferred transition found. Using first available: $TRANSITION_NAME (ID: $TRANSITION_ID)"
         fi
         
         if [[ -n "$TRANSITION_ID" ]]; then
-          echo "Transitioning ${JIRA_ISSUE} with transition ID: ${TRANSITION_ID}"
+          echo "Transitioning ${JIRA_ISSUE} with transition: ${TRANSITION_NAME} (ID: ${TRANSITION_ID})"
           
           # Add PR link in comment
           PR_URL="${{ github.event.pull_request.html_url }}"
@@ -165,20 +297,96 @@ runs:
           }"
           
           # Add comment
+          echo "Adding comment with PR link..."
           curl -s -X POST \
             -H "Authorization: Basic ${AUTH}" \
             -H "Content-Type: application/json" \
             --data "$COMMENT_DATA" \
             "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/comment"
           
-          # Perform the transition
-          curl -s -X POST \
+          # Check if resolution field is required for this transition
+          TRANSITIONS_WITH_FIELDS=$(curl -s \
             -H "Authorization: Basic ${AUTH}" \
             -H "Content-Type: application/json" \
-            --data "{\"transition\":{\"id\":\"${TRANSITION_ID}\"}}" \
-            "${TRANSITIONS_URL}"
+            "${TRANSITIONS_URL}?expand=transitions.fields")
           
-          echo "✅ Jira issue ${JIRA_ISSUE} transitioned successfully"
+          REQUIRES_RESOLUTION=$(echo "$TRANSITIONS_WITH_FIELDS" | jq -r ".transitions[] | select(.id == \"$TRANSITION_ID\") | .fields.resolution")
+          
+          if [[ "$REQUIRES_RESOLUTION" != "null" && -n "$REQUIRES_RESOLUTION" ]]; then
+            echo "This transition requires a resolution field"
+            
+            # Find available resolutions
+            RESOLUTIONS=$(echo "$TRANSITIONS_WITH_FIELDS" | jq -r ".transitions[] | select(.id == \"$TRANSITION_ID\") | .fields.resolution.allowedValues")
+            
+            if [[ -n "$RESOLUTIONS" && "$RESOLUTIONS" != "null" ]]; then
+              # Find a suitable resolution (prefer "Done" or "Fixed")
+              RESOLUTION_ID=$(echo "$RESOLUTIONS" | jq -r '.[] | select(.name == "Done" or .name == "Fixed") | .id' | head -1)
+              
+              if [[ -z "$RESOLUTION_ID" ]]; then
+                # Use first available resolution
+                RESOLUTION_ID=$(echo "$RESOLUTIONS" | jq -r '.[0].id')
+              fi
+              
+              if [[ -n "$RESOLUTION_ID" ]]; then
+                echo "Setting resolution ID: $RESOLUTION_ID"
+                
+                # Perform transition with resolution
+                TRANSITION_DATA="{
+                  \"transition\": {
+                    \"id\": \"${TRANSITION_ID}\"
+                  },
+                  \"fields\": {
+                    \"resolution\": {
+                      \"id\": \"${RESOLUTION_ID}\"
+                    }
+                  }
+                }"
+                
+                # Perform transition with resolution
+                echo "Performing transition with resolution..."
+                curl -s -X POST \
+                  -H "Authorization: Basic ${AUTH}" \
+                  -H "Content-Type: application/json" \
+                  --data "$TRANSITION_DATA" \
+                  "${TRANSITIONS_URL}"
+              else
+                echo "No resolution ID found, trying transition without resolution"
+                # Perform simple transition
+                curl -s -X POST \
+                  -H "Authorization: Basic ${AUTH}" \
+                  -H "Content-Type: application/json" \
+                  --data "{\"transition\":{\"id\":\"${TRANSITION_ID}\"}}" \
+                  "${TRANSITIONS_URL}"
+              fi
+            else
+              echo "No resolution values found, trying transition without resolution"
+              # Perform simple transition
+              curl -s -X POST \
+                -H "Authorization: Basic ${AUTH}" \
+                -H "Content-Type: application/json" \
+                --data "{\"transition\":{\"id\":\"${TRANSITION_ID}\"}}" \
+                "${TRANSITIONS_URL}"
+            fi
+          else
+            echo "No resolution required, performing simple transition"
+            # Perform simple transition
+            curl -s -X POST \
+              -H "Authorization: Basic ${AUTH}" \
+              -H "Content-Type: application/json" \
+              --data "{\"transition\":{\"id\":\"${TRANSITION_ID}\"}}" \
+              "${TRANSITIONS_URL}"
+          fi
+          
+          # Verify the transition
+          sleep 2 # Wait a moment for the transition to complete
+          UPDATED_ISSUE=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${ISSUE_URL}")
+          NEW_STATUS=$(echo "$UPDATED_ISSUE" | jq -r '.fields.status.name')
+          
+          if [[ "$NEW_STATUS" != "$CURRENT_STATUS" ]]; then
+            echo "✅ Jira issue ${JIRA_ISSUE} successfully transitioned from '$CURRENT_STATUS' to '$NEW_STATUS'"
+          else
+            echo "⚠️ Transition may have failed. Status is still '$CURRENT_STATUS'"
+          fi
         else
-          echo "❌ Could not find transition ID for '$TRANSITION'"
+          echo "❌ No valid transitions are available for this issue"
         fi
