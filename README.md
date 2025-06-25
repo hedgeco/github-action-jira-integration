@@ -2,7 +2,7 @@
 
 This reusable GitHub Action automates the integration between GitHub pull requests and Jira issues.
 
-> **Note:** This action was tested with INVEST-2204 and works correctly.
+> **Note:** This action was tested with INVEST-2204 and works correctly. Testing PR/Jira integration on June 25, 2025.
 
 ## Features
 
