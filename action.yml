@@ -193,7 +193,7 @@ runs:
           fi
         else
           echo "❌ Could not find suitable transition for PR opening"
-        fi- name: Transition Jira Issue on PR Merge
+        fi        fi    - name: Transition Jira Issue on PR Merge
       if: env.JIRA_ISSUE_FOUND == 'true' && github.event.pull_request.merged == true
       shell: bash
       run: |
@@ -214,63 +214,162 @@ runs:
         # Extract issue type and status
         ISSUE_TYPE=$(echo "$ISSUE_DATA" | jq -r '.fields.issuetype.name')
         CURRENT_STATUS=$(echo "$ISSUE_DATA" | jq -r '.fields.status.name')
+        PROJECT_KEY=$(echo "$ISSUE_DATA" | jq -r '.fields.project.key')
+        PROJECT_ID=$(echo "$ISSUE_DATA" | jq -r '.fields.project.id')
         
         echo "Issue Type: $ISSUE_TYPE"
         echo "Current Status: $CURRENT_STATUS"
+        echo "Project: $PROJECT_KEY (ID: $PROJECT_ID)"
         
         # Get available transitions
         TRANSITIONS_URL="${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/transitions"
-        TRANSITIONS=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${TRANSITIONS_URL}")
+        TRANSITIONS=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${TRANSITIONS_URL}?expand=transitions.fields")
         
-        echo "Available transitions:"
-        echo "$TRANSITIONS" | jq -r '.transitions[] | "- \(.name) (ID: \(.id))"'
+        echo "Available transitions from current status:"
+        echo "$TRANSITIONS" | jq -r '.transitions[] | "- \(.name) (ID: \(.id)) -> \(.to.name // "Unknown")"'
         
-        # Try to find the best transition based on issue type and available transitions
-        # Priority order for transitions
-        TRANSITION_CANDIDATES=("$PREFERRED_TRANSITION" "Complete" "Done" "Ready for QA" "In Review" "Resolved")
+        # First, try to get the workflow for this project/issue type to understand status progression
+        echo "Analyzing workflow progression..."
         
-        # Special transitions for certain issue types
-        if [[ "$ISSUE_TYPE" == "Story" || "$ISSUE_TYPE" == "Task" ]]; then
-          # Add story/task specific transitions if needed
-          TRANSITION_CANDIDATES+=("Ready for Testing" "Development Complete")
-        elif [[ "$ISSUE_TYPE" == "Bug" ]]; then
-          # Add bug specific transitions
-          TRANSITION_CANDIDATES+=("Fixed" "Verified")
-        fi
+        # Get project's workflow schemes
+        SCHEME_URL="${JIRA_BASE_URL}/rest/api/3/workflowscheme/project/$PROJECT_ID"
+        WORKFLOW_SCHEME=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "$SCHEME_URL")
+        SCHEME_ID=$(echo "$WORKFLOW_SCHEME" | jq -r '.id')
         
-        # Find the first available transition from our candidates
-        TRANSITION_ID=""
-        TRANSITION_NAME=""
+        echo "Workflow scheme ID: $SCHEME_ID"
         
-        for TRANSITION_CANDIDATE in "${TRANSITION_CANDIDATES[@]}"; do
-          echo "Checking if '$TRANSITION_CANDIDATE' transition is available..."
+        # Try to determine the next logical status in the workflow
+        # We want to select the next status based on these criteria:
+        # 1. First try to find transitions like "Complete", "Done", "Ready for QA", etc.
+        # 2. If not found, try to understand the workflow progression
+        # 3. If still not clear, use the first available transition
+        
+        # Analyze current transitions to find the next logical status
+        # This logic determines what's "after" development in typical workflows
+        
+        # Function to determine the "weight" of a status - higher is further along in workflow
+        # We use this to find statuses that are "forward" in the workflow
+        function get_status_weight {
+          local status=$1
+          local lower_status=$(echo "$status" | tr '[:upper:]' '[:lower:]')
           
-          # Try exact match first
-          EXACT_MATCH=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name == \"$TRANSITION_CANDIDATE\") | .id")
-          
-          if [[ -n "$EXACT_MATCH" ]]; then
-            TRANSITION_ID="$EXACT_MATCH"
-            TRANSITION_NAME="$TRANSITION_CANDIDATE"
-            echo "Found exact match: $TRANSITION_NAME (ID: $TRANSITION_ID)"
-            break
+          # Map common status names to weights based on typical workflow order
+          case $lower_status in
+            *backlog*)
+              echo 10 ;;
+            *todo*)
+              echo 20 ;;
+            *planning*)
+              echo 30 ;;
+            *start*)
+              echo 40 ;;
+            *progress* | *development* | *dev*)
+              echo 50 ;;
+            *review* | *pr*)
+              echo 60 ;;
+            *test* | *qa*)
+              echo 70 ;;
+            *ready*qa* | *ready*test* | *ready*review*)
+              echo 75 ;;
+            *verify* | *validation*)
+              echo 80 ;;
+            *done* | *complete* | *resolved* | *fixed*)
+              echo 90 ;;
+            *closed* | *deployed* | *released*)
+              echo 100 ;;
+            *)
+              echo 50 ;;  # Default weight
+          esac
+        }
+        
+        # Get the weight of the current status
+        CURRENT_WEIGHT=$(get_status_weight "$CURRENT_STATUS")
+        
+        echo "Current status weight: $CURRENT_WEIGHT"
+        
+        # Find transitions that move the issue "forward" in the workflow
+        declare -A TRANSITION_SCORES
+        HIGHEST_SCORE=0
+        BEST_TRANSITION_ID=""
+        BEST_TRANSITION_NAME=""
+        
+        while IFS= read -r line; do
+          if [[ -n "$line" ]]; then
+            TRANSITION_ID=$(echo "$line" | jq -r '.id')
+            TRANSITION_NAME=$(echo "$line" | jq -r '.name')
+            TO_STATUS=$(echo "$line" | jq -r '.to.name // "Unknown"')
+            
+            # Skip transitions that keep us in the same status
+            if [[ "$TO_STATUS" == "$CURRENT_STATUS" ]]; then
+              continue
+            fi
+            
+            # Calculate score based on several factors
+            SCORE=0
+            TO_WEIGHT=$(get_status_weight "$TO_STATUS")
+            
+            # Favor forward movement in the workflow
+            if [[ $TO_WEIGHT -gt $CURRENT_WEIGHT ]]; then
+              # Prefer significant forward movement but not too big jumps
+              WEIGHT_DIFF=$((TO_WEIGHT - CURRENT_WEIGHT))
+              if [[ $WEIGHT_DIFF -le 30 ]]; then
+                # Natural progression
+                SCORE=$((SCORE + WEIGHT_DIFF))
+              else
+                # Potentially skipping steps
+                SCORE=$((SCORE + 30))
+              fi
+            fi
+            
+            # Boost score for preferred transition names
+            LOWER_NAME=$(echo "$TRANSITION_NAME" | tr '[:upper:]' '[:lower:]')
+            LOWER_TO_STATUS=$(echo "$TO_STATUS" | tr '[:upper:]' '[:lower:]')
+            
+            # Exact match for preferred transition gets highest priority
+            if [[ "$TRANSITION_NAME" == "$PREFERRED_TRANSITION" ]]; then
+              SCORE=$((SCORE + 100))
+            fi
+            
+            # Preferred transition types (in order of preference)
+            if [[ "$LOWER_NAME" == *"done"* || "$LOWER_TO_STATUS" == *"done"* ]]; then
+              SCORE=$((SCORE + 50))
+            elif [[ "$LOWER_NAME" == *"complete"* || "$LOWER_TO_STATUS" == *"complete"* ]]; then
+              SCORE=$((SCORE + 45))
+            elif [[ "$LOWER_NAME" == *"resolved"* || "$LOWER_TO_STATUS" == *"resolved"* ]]; then
+              SCORE=$((SCORE + 40))
+            elif [[ "$LOWER_NAME" == *"fixed"* || "$LOWER_TO_STATUS" == *"fixed"* ]]; then
+              SCORE=$((SCORE + 35))
+            elif [[ "$LOWER_NAME" == *"qa"* || "$LOWER_TO_STATUS" == *"qa"* || 
+                    "$LOWER_NAME" == *"test"* || "$LOWER_TO_STATUS" == *"test"* ]]; then
+              SCORE=$((SCORE + 30))
+            elif [[ "$LOWER_NAME" == *"review"* || "$LOWER_TO_STATUS" == *"review"* ]]; then
+              SCORE=$((SCORE + 25))
+            fi
+            
+            echo "Transition: $TRANSITION_NAME -> $TO_STATUS (Score: $SCORE)"
+            
+            TRANSITION_SCORES["$TRANSITION_ID"]=$SCORE
+            
+            if (( SCORE > HIGHEST_SCORE )); then
+              HIGHEST_SCORE=$SCORE
+              BEST_TRANSITION_ID=$TRANSITION_ID
+              BEST_TRANSITION_NAME=$TRANSITION_NAME
+              BEST_TO_STATUS=$TO_STATUS
+            fi
           fi
-          
-          # Try case-insensitive partial match
-          PARTIAL_MATCH=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name | ascii_downcase | contains(\"$(echo $TRANSITION_CANDIDATE | tr '[:upper:]' '[:lower:]')\")) | .id" | head -1)
-          
-          if [[ -n "$PARTIAL_MATCH" ]]; then
-            TRANSITION_ID="$PARTIAL_MATCH"
-            TRANSITION_NAME=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.id == \"$PARTIAL_MATCH\") | .name")
-            echo "Found partial match: $TRANSITION_NAME (ID: $TRANSITION_ID)"
-            break
-          fi
-        done
+        done < <(echo "$TRANSITIONS" | jq -c '.transitions[]')
         
-        if [[ -z "$TRANSITION_ID" && -n "$TRANSITIONS" ]]; then
-          # If we still don't have a match, use the first available transition
+        if [[ -n "$BEST_TRANSITION_ID" ]]; then
+          echo "Found best transition: $BEST_TRANSITION_NAME (ID: $BEST_TRANSITION_ID) -> $BEST_TO_STATUS (Score: $HIGHEST_SCORE)"
+          TRANSITION_ID=$BEST_TRANSITION_ID
+          TRANSITION_NAME=$BEST_TRANSITION_NAME
+        elif [[ -n "$TRANSITIONS" ]]; then
+          # If we couldn't determine best transition, use first available
           TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[0].id')
           TRANSITION_NAME=$(echo "$TRANSITIONS" | jq -r '.transitions[0].name')
-          echo "No preferred transition found. Using first available: $TRANSITION_NAME (ID: $TRANSITION_ID)"
+          echo "No optimal transition found. Using first available: $TRANSITION_NAME (ID: $TRANSITION_ID)"
+        else
+          echo "No transitions available"
         fi
         
         if [[ -n "$TRANSITION_ID" ]]; then
@@ -305,18 +404,13 @@ runs:
             "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/comment"
           
           # Check if resolution field is required for this transition
-          TRANSITIONS_WITH_FIELDS=$(curl -s \
-            -H "Authorization: Basic ${AUTH}" \
-            -H "Content-Type: application/json" \
-            "${TRANSITIONS_URL}?expand=transitions.fields")
-          
-          REQUIRES_RESOLUTION=$(echo "$TRANSITIONS_WITH_FIELDS" | jq -r ".transitions[] | select(.id == \"$TRANSITION_ID\") | .fields.resolution")
+          REQUIRES_RESOLUTION=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.id == \"$TRANSITION_ID\") | .fields.resolution")
           
           if [[ "$REQUIRES_RESOLUTION" != "null" && -n "$REQUIRES_RESOLUTION" ]]; then
             echo "This transition requires a resolution field"
             
             # Find available resolutions
-            RESOLUTIONS=$(echo "$TRANSITIONS_WITH_FIELDS" | jq -r ".transitions[] | select(.id == \"$TRANSITION_ID\") | .fields.resolution.allowedValues")
+            RESOLUTIONS=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.id == \"$TRANSITION_ID\") | .fields.resolution.allowedValues")
             
             if [[ -n "$RESOLUTIONS" && "$RESOLUTIONS" != "null" ]]; then
               # Find a suitable resolution (prefer "Done" or "Fixed")
