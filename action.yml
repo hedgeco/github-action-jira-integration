@@ -63,10 +63,11 @@ runs:
           echo "Found Jira issue key in branch name: $JIRA_ISSUE"
           echo "JIRA_ISSUE=$JIRA_ISSUE" >> $GITHUB_ENV
           echo "JIRA_ISSUE_FOUND=true" >> $GITHUB_ENV
-        else
-          echo "No Jira issue key found in PR title or branch name"
+        else          echo "No Jira issue key found in PR title or branch name"
           echo "JIRA_ISSUE_FOUND=false" >> $GITHUB_ENV
-        fi    - name: Add Jira Info to PR Description
+        fi
+        
+    - name: Add Jira Info to PR Description
       if: env.JIRA_ISSUE_FOUND == 'true' && github.event.action != 'closed'
       uses: cakeinpanic/jira-description-action@v0.4.0
       with:
@@ -187,13 +188,15 @@ runs:
           NEW_STATUS=$(echo "$UPDATED_ISSUE" | jq -r '.fields.status.name')
           
           if [[ "$NEW_STATUS" != "$CURRENT_STATUS" ]]; then
-            echo "✅ Jira issue ${JIRA_ISSUE} successfully transitioned from '$CURRENT_STATUS' to '$NEW_STATUS'"
-          else
+            echo "✅ Jira issue ${JIRA_ISSUE} successfully transitioned from '$CURRENT_STATUS' to '$NEW_STATUS'"          else
             echo "⚠️ Transition may have failed. Status is still '$CURRENT_STATUS'"
           fi
         else
           echo "❌ Could not find suitable transition for PR opening"
-        fi        fi    - name: Transition Jira Issue on PR Merge
+        fi
+      fi
+        
+    - name: Transition Jira Issue on PR Merge
       if: env.JIRA_ISSUE_FOUND == 'true' && github.event.pull_request.merged == true
       shell: bash
       run: |
