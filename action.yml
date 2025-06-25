@@ -73,10 +73,11 @@ runs:
       uses: cakeinpanic/jira-description-action@v0.4.0
       with:
         github-token: ${{ inputs.github-token }}
-        jira-token: ${{ inputs.jira-api-token }}
-        jira-base-url: ${{ inputs.jira-base-url }}
+        jira-token: ${{ inputs.jira-api-token }}        jira-base-url: ${{ inputs.jira-base-url }}
         skip-branches: '^(main|master|dev|develop|release)$'
-        custom-issue-number-regexp: '([A-Z]+-[0-9]+)'    - name: Transition Jira Issue on PR Open
+        custom-issue-number-regexp: '([A-Z]+-[0-9]+)'
+    
+    - name: Transition Jira Issue on PR Open
       if: env.JIRA_ISSUE_FOUND == 'true' && github.event.action == 'opened'
       shell: bash
       run: |
