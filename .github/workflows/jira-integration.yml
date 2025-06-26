@@ -25,19 +25,21 @@ jobs:
           
           if [[ -n "$JIRA_ISSUE" ]]; then
             echo "Found Jira issue key: $JIRA_ISSUE"
-            echo "JIRA_ISSUE=$JIRA_ISSUE" >> $GITHUB_ENV
-            echo "JIRA_ISSUE_FOUND=true" >> $GITHUB_ENV
-          else            echo "No Jira issue key found in PR title or branch name"
-            echo "JIRA_ISSUE_FOUND=false" >> $GITHUB_ENV
+            echo "jira_issue=${JIRA_ISSUE}" >> $GITHUB_OUTPUT
+            echo "jira_issue_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "No Jira issue key found in PR title or branch name"
+            echo "jira_issue_found=false" >> $GITHUB_OUTPUT
           fi
         shell: bash
-          - name: Check Jira Issue Status
-        if: ${{ env.JIRA_ISSUE_FOUND == 'true' }}
+
+      - name: Check Jira Issue Status
+        if: ${{ steps.extract_jira_key.outputs.jira_issue_found == 'true' }}
         run: |
           JIRA_BASE_URL="${{ secrets.JIRA_BASE_URL }}"
           JIRA_EMAIL="${{ secrets.JIRA_USER_EMAIL }}"
           JIRA_TOKEN="${{ secrets.JIRA_API_TOKEN }}"
-          JIRA_ISSUE="${{ env.JIRA_ISSUE }}"
+          JIRA_ISSUE="${{ steps.extract_jira_key.outputs.jira_issue }}"
           
           echo "GitHub event action: ${{ github.event.action }}"
           echo "PR merged: ${{ github.event.pull_request.merged }}"
