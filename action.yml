@@ -1,72 +1,61 @@
-name: 'Jira Integration Action'
-description: 'Integrates GitHub pull requests with Jira tickets for status updates and tracking'
-author: 'HedgeCo Vest'
-branding:
-  icon: 'link'
-  color: 'blue'
+name: 'GitHub-Jira Integration'
+description: 'Integrates GitHub PRs with Jira issues - automatically adds Jira details to PRs and updates Jira status on merge'
+author: 'SmartX Advisory'
 
 inputs:
+  github-token:
+    description: 'GitHub token for API access'
+    required: true
+    default: ${{ github.token }}
   jira-base-url:
-    description: 'Base URL of your Jira instance (e.g., https://smartx.atlassian.net)'
+    description: 'Base URL of your Jira instance (e.g., https://your-domain.atlassian.net)'
     required: true
   jira-user-email:
-    description: 'Email address associated with your Jira API token'
+    description: 'Email address of the Jira API user'
     required: true
   jira-api-token:
-    description: 'Jira API token for authentication'
+    description: 'API token for Jira authentication'
     required: true
-  github-token:
-    description: 'GitHub token for authentication'
-    default: ${{ github.token }}
-    required: false
   pr-open-transition:
-    description: 'Jira transition to trigger when PR is opened (name or ID)'
+    description: 'Transition to use when PR is opened'
+    required: false
     default: 'In Progress'
-    required: false
   pr-merge-transition:
-    description: 'Jira transition to trigger when PR is merged (name or ID)'
-    default: 'Complete'
+    description: 'Transition to use when PR is merged'
     required: false
+    default: 'Complete'
   jira-project-key:
-    description: 'The key of the Jira project (e.g., INVEST, SMX)'
+    description: 'Optional: Limit to issues from a specific Jira project'
     required: false
     default: ''
 
 runs:
-  using: 'composite'
+  using: "composite"
   steps:
     - name: Extract Jira Issue Key
-      id: extract_jira_key
+      id: extract-jira-key
       shell: bash
       run: |
         PR_TITLE="${{ github.event.pull_request.title }}"
-        PR_BRANCH="${{ github.event.pull_request.head.ref }}"
+        BRANCH_NAME="${{ github.head_ref || github.ref_name }}"
         
-        # Extract the Jira issue key from either PR title or branch name
-        PROJECT_KEY="${{ inputs.jira-project-key }}"
-        
-        if [[ -z "$PROJECT_KEY" ]]; then
-          # Look for any pattern that resembles a Jira ticket (uppercase letters followed by numbers)
-          PATTERN="([A-Z]+-[0-9]+)"
-        else
-          # Look for the specific project key
-          PATTERN="($PROJECT_KEY-[0-9]+)"
+        # Try to extract from PR title first
+        if [[ "$PR_TITLE" =~ ([A-Z]+-[0-9]+) ]]; then
+          ISSUE_KEY=${BASH_REMATCH[1]}
+        # Then try branch name
+        elif [[ "$BRANCH_NAME" =~ ([A-Z]+-[0-9]+) ]]; then
+          ISSUE_KEY=${BASH_REMATCH[1]}
         fi
         
-        if [[ "$PR_TITLE" =~ $PATTERN ]]; then
-          JIRA_ISSUE="${BASH_REMATCH[1]}"
-          echo "Found Jira issue key in PR title: $JIRA_ISSUE"
-          echo "JIRA_ISSUE=$JIRA_ISSUE" >> $GITHUB_ENV
+        if [[ -n "$ISSUE_KEY" ]]; then
+          echo "Found Jira issue key: $ISSUE_KEY"
+          echo "JIRA_ISSUE=$ISSUE_KEY" >> $GITHUB_ENV
           echo "JIRA_ISSUE_FOUND=true" >> $GITHUB_ENV
-        elif [[ "$PR_BRANCH" =~ $PATTERN ]]; then
-          JIRA_ISSUE="${BASH_REMATCH[1]}"
-          echo "Found Jira issue key in branch name: $JIRA_ISSUE"
-          echo "JIRA_ISSUE=$JIRA_ISSUE" >> $GITHUB_ENV
-          echo "JIRA_ISSUE_FOUND=true" >> $GITHUB_ENV
-        else          echo "No Jira issue key found in PR title or branch name"
+        else
+          echo "No Jira issue key found in PR title or branch name"
           echo "JIRA_ISSUE_FOUND=false" >> $GITHUB_ENV
         fi
-        
+    
     - name: Add Jira Info to PR Description
       if: env.JIRA_ISSUE_FOUND == 'true' && github.event.action != 'closed'
       uses: cakeinpanic/jira-description-action@v0.4.0
@@ -89,11 +78,12 @@ runs:
         # Basic auth
         AUTH=$(echo -n "${JIRA_EMAIL}:${JIRA_TOKEN}" | base64)
         
+        echo "Getting Jira issue details for ${JIRA_ISSUE}..."
+        
         # Get issue details
         ISSUE_URL="${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}"
         ISSUE_DATA=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${ISSUE_URL}")
         
-        # Extract issue type and status
         ISSUE_TYPE=$(echo "$ISSUE_DATA" | jq -r '.fields.issuetype.name')
         CURRENT_STATUS=$(echo "$ISSUE_DATA" | jq -r '.fields.status.name')
         
@@ -117,70 +107,48 @@ runs:
         # Priority order for transitions when PR is opened
         TRANSITION_CANDIDATES=("$PREFERRED_TRANSITION" "In Progress" "Development" "Start Work" "Start Development")
         
-        # Find the first available transition from our candidates
         TRANSITION_ID=""
         TRANSITION_NAME=""
         
-        for TRANSITION_CANDIDATE in "${TRANSITION_CANDIDATES[@]}"; do
-          echo "Checking if '$TRANSITION_CANDIDATE' transition is available..."
-          
-          # Try exact match first
-          EXACT_MATCH=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name == \"$TRANSITION_CANDIDATE\") | .id")
-          
-          if [[ -n "$EXACT_MATCH" ]]; then
-            TRANSITION_ID="$EXACT_MATCH"
-            TRANSITION_NAME="$TRANSITION_CANDIDATE"
-            echo "Found exact match: $TRANSITION_NAME (ID: $TRANSITION_ID)"
-            break
-          fi
-          
-          # Try case-insensitive partial match
-          PARTIAL_MATCH=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.name | ascii_downcase | contains(\"$(echo $TRANSITION_CANDIDATE | tr '[:upper:]' '[:lower:]')\")) | .id" | head -1)
-          
-          if [[ -n "$PARTIAL_MATCH" ]]; then
-            TRANSITION_ID="$PARTIAL_MATCH"
-            TRANSITION_NAME=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.id == \"$PARTIAL_MATCH\") | .name")
-            echo "Found partial match: $TRANSITION_NAME (ID: $TRANSITION_ID)"
-            break
+        for candidate in "${TRANSITION_CANDIDATES[@]}"; do
+          if [[ -z "$TRANSITION_ID" ]] && [[ -n "$candidate" ]]; then
+            # Try exact match
+            EXACT_MATCH=$(echo "$TRANSITIONS" | jq -r --arg name "$candidate" '.transitions[] | select(.name==$name) | .id')
+            
+            if [[ -n "$EXACT_MATCH" ]]; then
+              TRANSITION_ID="$EXACT_MATCH"
+              TRANSITION_NAME="$candidate"
+              echo "Found exact transition match: $TRANSITION_NAME (ID: $TRANSITION_ID)"
+              break
+            fi
+            
+            # Try partial match
+            PARTIAL_MATCH=$(echo "$TRANSITIONS" | jq -r --arg name "$candidate" '.transitions[] | select(.name | ascii_downcase | contains($name | ascii_downcase)) | .id' | head -n1)
+            
+            if [[ -n "$PARTIAL_MATCH" ]]; then
+              TRANSITION_ID="$PARTIAL_MATCH"
+              TRANSITION_NAME=$(echo "$TRANSITIONS" | jq -r --arg id "$PARTIAL_MATCH" '.transitions[] | select(.id==$id) | .name')
+              echo "Found partial transition match: $TRANSITION_NAME (ID: $TRANSITION_ID)"
+              break
+            fi
           fi
         done
         
+        # If no match found yet, use the first available transition
+        if [[ -z "$TRANSITION_ID" ]]; then
+          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[0].id')
+          TRANSITION_NAME=$(echo "$TRANSITIONS" | jq -r '.transitions[0].name')
+          echo "No matching transition found, using first available: $TRANSITION_NAME (ID: $TRANSITION_ID)"
+        fi
+        
         if [[ -n "$TRANSITION_ID" ]]; then
-          echo "Transitioning ${JIRA_ISSUE} with transition: ${TRANSITION_NAME} (ID: ${TRANSITION_ID})"
+          echo "Transitioning issue to: $TRANSITION_NAME"
           
-          # Add PR link in comment
-          PR_URL="${{ github.event.pull_request.html_url }}"
-          COMMENT_DATA="{
-            \"body\": {
-              \"type\": \"doc\",
-              \"version\": 1,
-              \"content\": [
-                {
-                  \"type\": \"paragraph\",
-                  \"content\": [
-                    {
-                      \"type\": \"text\",
-                      \"text\": \"PR opened: ${PR_URL}\"
-                    }
-                  ]
-                }
-              ]
-            }
-          }"
-          
-          # Add comment
-          curl -s -X POST \
-            -H "Authorization: Basic ${AUTH}" \
-            -H "Content-Type: application/json" \
-            --data "$COMMENT_DATA" \
-            "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/comment"
-          
-          # Perform the transition
-          curl -s -X POST \
+          TRANSITION_RESULT=$(curl -s -X POST \
             -H "Authorization: Basic ${AUTH}" \
             -H "Content-Type: application/json" \
             --data "{\"transition\":{\"id\":\"${TRANSITION_ID}\"}}" \
-            "${TRANSITIONS_URL}"
+            "${TRANSITIONS_URL}")
           
           # Verify the transition
           sleep 2 # Wait a moment for the transition to complete
@@ -188,14 +156,14 @@ runs:
           NEW_STATUS=$(echo "$UPDATED_ISSUE" | jq -r '.fields.status.name')
           
           if [[ "$NEW_STATUS" != "$CURRENT_STATUS" ]]; then
-            echo "✅ Jira issue ${JIRA_ISSUE} successfully transitioned from '$CURRENT_STATUS' to '$NEW_STATUS'"          else
+            echo "✅ Jira issue ${JIRA_ISSUE} successfully transitioned from '$CURRENT_STATUS' to '$NEW_STATUS'"
+          else
             echo "⚠️ Transition may have failed. Status is still '$CURRENT_STATUS'"
           fi
         else
           echo "❌ Could not find suitable transition for PR opening"
         fi
-      fi
-        
+    
     - name: Transition Jira Issue on PR Merge
       if: env.JIRA_ISSUE_FOUND == 'true' && github.event.pull_request.merged == true
       shell: bash
@@ -210,48 +178,27 @@ runs:
         
         echo "Getting Jira issue details for ${JIRA_ISSUE}..."
         
-        # Get issue details to determine type and current status
+        # Get issue details
         ISSUE_URL="${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}"
         ISSUE_DATA=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${ISSUE_URL}")
         
-        # Extract issue type and status
         ISSUE_TYPE=$(echo "$ISSUE_DATA" | jq -r '.fields.issuetype.name')
         CURRENT_STATUS=$(echo "$ISSUE_DATA" | jq -r '.fields.status.name')
-        PROJECT_KEY=$(echo "$ISSUE_DATA" | jq -r '.fields.project.key')
-        PROJECT_ID=$(echo "$ISSUE_DATA" | jq -r '.fields.project.id')
         
         echo "Issue Type: $ISSUE_TYPE"
         echo "Current Status: $CURRENT_STATUS"
-        echo "Project: $PROJECT_KEY (ID: $PROJECT_ID)"
+        
+        # Get all project statuses and current workflow
+        PROJECT_KEY=$(echo ${JIRA_ISSUE} | cut -d'-' -f1)
         
         # Get available transitions
         TRANSITIONS_URL="${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/transitions"
-        TRANSITIONS=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${TRANSITIONS_URL}?expand=transitions.fields")
+        TRANSITIONS=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "${TRANSITIONS_URL}")
         
-        echo "Available transitions from current status:"
-        echo "$TRANSITIONS" | jq -r '.transitions[] | "- \(.name) (ID: \(.id)) -> \(.to.name // "Unknown")"'
-        
-        # First, try to get the workflow for this project/issue type to understand status progression
-        echo "Analyzing workflow progression..."
-        
-        # Get project's workflow schemes
-        SCHEME_URL="${JIRA_BASE_URL}/rest/api/3/workflowscheme/project/$PROJECT_ID"
-        WORKFLOW_SCHEME=$(curl -s -H "Authorization: Basic ${AUTH}" -H "Content-Type: application/json" "$SCHEME_URL")
-        SCHEME_ID=$(echo "$WORKFLOW_SCHEME" | jq -r '.id')
-        
-        echo "Workflow scheme ID: $SCHEME_ID"
-        
-        # Try to determine the next logical status in the workflow
-        # We want to select the next status based on these criteria:
-        # 1. First try to find transitions like "Complete", "Done", "Ready for QA", etc.
-        # 2. If not found, try to understand the workflow progression
-        # 3. If still not clear, use the first available transition
-        
-        # Analyze current transitions to find the next logical status
-        # This logic determines what's "after" development in typical workflows
+        echo "Available transitions:"
+        echo "$TRANSITIONS" | jq -r '.transitions[] | "- \(.name) (ID: \(.id))"'
         
         # Function to determine the "weight" of a status - higher is further along in workflow
-        # We use this to find statuses that are "forward" in the workflow
         function get_status_weight {
           local status=$1
           local lower_status=$(echo "$status" | tr '[:upper:]' '[:lower:]')
@@ -266,41 +213,49 @@ runs:
               echo 30 ;;
             *start*)
               echo 40 ;;
-            *progress* | *development* | *dev*)
+            *progress*|*development*)
               echo 50 ;;
-            *review* | *pr*)
+            *review*|*pr*)
               echo 60 ;;
-            *test* | *qa*)
+            *testing*|*test*|*qa*)
               echo 70 ;;
-            *ready*qa* | *ready*test* | *ready*review*)
-              echo 75 ;;
-            *verify* | *validation*)
+            *verification*|*verify*)
               echo 80 ;;
-            *done* | *complete* | *resolved* | *fixed*)
+            *ready*release*)
               echo 90 ;;
-            *closed* | *deployed* | *released*)
+            *release*|*deploy*|*released*)
               echo 100 ;;
+            *done*|*complete*|*finish*)
+              echo 110 ;;
+            *close*|*resolve*)
+              echo 120 ;;
+            *cancel*|*abandon*)
+              echo -10 ;;
             *)
-              echo 50 ;;  # Default weight
+              echo 0 ;;
           esac
         }
         
-        # Get the weight of the current status
+        # Track current status weight
         CURRENT_WEIGHT=$(get_status_weight "$CURRENT_STATUS")
         
         echo "Current status weight: $CURRENT_WEIGHT"
         
-        # Find transitions that move the issue "forward" in the workflow
-        declare -A TRANSITION_SCORES
-        HIGHEST_SCORE=0
-        BEST_TRANSITION_ID=""
-        BEST_TRANSITION_NAME=""
+        # Try the transitions in priority order
+        TRANSITION_CANDIDATES=("$PREFERRED_TRANSITION" "Complete" "Done" "Resolve" "Closed" "In Review" "Ready for QA" "QA" "Testing")
+        
+        TRANSITION_ID=""
+        TRANSITION_NAME=""
+        BEST_SCORE=-1000
+        
+        # Parse transitions into a usable format for scoring
+        TRANSITIONS_DATA=$(echo "$TRANSITIONS" | jq -r '.transitions[] | .id + "|" + .name + "|" + (.to.name // "Unknown")')
         
         while IFS= read -r line; do
           if [[ -n "$line" ]]; then
-            TRANSITION_ID=$(echo "$line" | jq -r '.id')
-            TRANSITION_NAME=$(echo "$line" | jq -r '.name')
-            TO_STATUS=$(echo "$line" | jq -r '.to.name // "Unknown"')
+            TRANSITION_ID=$(echo "$line" | cut -d'|' -f1)
+            TRANSITION_NAME=$(echo "$line" | cut -d'|' -f2)
+            TO_STATUS=$(echo "$line" | cut -d'|' -f3)
             
             # Skip transitions that keep us in the same status
             if [[ "$TO_STATUS" == "$CURRENT_STATUS" ]]; then
@@ -316,161 +271,80 @@ runs:
               # Prefer significant forward movement but not too big jumps
               WEIGHT_DIFF=$((TO_WEIGHT - CURRENT_WEIGHT))
               if [[ $WEIGHT_DIFF -le 30 ]]; then
-                # Natural progression
-                SCORE=$((SCORE + WEIGHT_DIFF))
+                SCORE=$((SCORE + 50))
+                
+                # Extra points for just the right amount of movement
+                if [[ $WEIGHT_DIFF -ge 10 && $WEIGHT_DIFF -le 20 ]]; then
+                  SCORE=$((SCORE + 25))
+                fi
               else
-                # Potentially skipping steps
-                SCORE=$((SCORE + 30))
+                # Penalize big jumps slightly
+                SCORE=$((SCORE + 25))
               fi
+            else
+              # Penalize backward movement
+              SCORE=$((SCORE - 50))
             fi
             
-            # Boost score for preferred transition names
-            LOWER_NAME=$(echo "$TRANSITION_NAME" | tr '[:upper:]' '[:lower:]')
-            LOWER_TO_STATUS=$(echo "$TO_STATUS" | tr '[:upper:]' '[:lower:]')
-            
-            # Exact match for preferred transition gets highest priority
-            if [[ "$TRANSITION_NAME" == "$PREFERRED_TRANSITION" ]]; then
-              SCORE=$((SCORE + 100))
-            fi
-            
-            # Preferred transition types (in order of preference)
-            if [[ "$LOWER_NAME" == *"done"* || "$LOWER_TO_STATUS" == *"done"* ]]; then
-              SCORE=$((SCORE + 50))
-            elif [[ "$LOWER_NAME" == *"complete"* || "$LOWER_TO_STATUS" == *"complete"* ]]; then
-              SCORE=$((SCORE + 45))
-            elif [[ "$LOWER_NAME" == *"resolved"* || "$LOWER_TO_STATUS" == *"resolved"* ]]; then
-              SCORE=$((SCORE + 40))
-            elif [[ "$LOWER_NAME" == *"fixed"* || "$LOWER_TO_STATUS" == *"fixed"* ]]; then
-              SCORE=$((SCORE + 35))
-            elif [[ "$LOWER_NAME" == *"qa"* || "$LOWER_TO_STATUS" == *"qa"* || 
-                    "$LOWER_NAME" == *"test"* || "$LOWER_TO_STATUS" == *"test"* ]]; then
-              SCORE=$((SCORE + 30))
-            elif [[ "$LOWER_NAME" == *"review"* || "$LOWER_TO_STATUS" == *"review"* ]]; then
-              SCORE=$((SCORE + 25))
-            fi
+            # Check for preferred transition
+            for candidate in "${TRANSITION_CANDIDATES[@]}"; do
+              if [[ -n "$candidate" ]]; then
+                if [[ "$TRANSITION_NAME" == "$candidate" ]]; then
+                  # Exact match
+                  SCORE=$((SCORE + 100))
+                  break
+                elif [[ "$TRANSITION_NAME" =~ $candidate ]]; then
+                  # Partial match
+                  SCORE=$((SCORE + 50))
+                  break
+                elif [[ "$TO_STATUS" == "$candidate" ]]; then
+                  # Destination status matches
+                  SCORE=$((SCORE + 75))
+                  break
+                elif [[ "$TO_STATUS" =~ $candidate ]]; then
+                  # Partial destination match
+                  SCORE=$((SCORE + 30))
+                  break
+                fi
+              fi
+            done
             
             echo "Transition: $TRANSITION_NAME -> $TO_STATUS (Score: $SCORE)"
             
-            TRANSITION_SCORES["$TRANSITION_ID"]=$SCORE
-            
-            if (( SCORE > HIGHEST_SCORE )); then
-              HIGHEST_SCORE=$SCORE
+            if [[ $SCORE -gt $BEST_SCORE ]]; then
+              BEST_SCORE=$SCORE
               BEST_TRANSITION_ID=$TRANSITION_ID
               BEST_TRANSITION_NAME=$TRANSITION_NAME
               BEST_TO_STATUS=$TO_STATUS
             fi
           fi
-        done < <(echo "$TRANSITIONS" | jq -c '.transitions[]')
+        done <<< "$TRANSITIONS_DATA"
         
         if [[ -n "$BEST_TRANSITION_ID" ]]; then
-          echo "Found best transition: $BEST_TRANSITION_NAME (ID: $BEST_TRANSITION_ID) -> $BEST_TO_STATUS (Score: $HIGHEST_SCORE)"
-          TRANSITION_ID=$BEST_TRANSITION_ID
-          TRANSITION_NAME=$BEST_TRANSITION_NAME
-        elif [[ -n "$TRANSITIONS" ]]; then
-          # If we couldn't determine best transition, use first available
-          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[0].id')
-          TRANSITION_NAME=$(echo "$TRANSITIONS" | jq -r '.transitions[0].name')
-          echo "No optimal transition found. Using first available: $TRANSITION_NAME (ID: $TRANSITION_ID)"
-        else
-          echo "No transitions available"
-        fi
-        
-        if [[ -n "$TRANSITION_ID" ]]; then
-          echo "Transitioning ${JIRA_ISSUE} with transition: ${TRANSITION_NAME} (ID: ${TRANSITION_ID})"
+          echo "Best transition: $BEST_TRANSITION_NAME (ID: $BEST_TRANSITION_ID) -> $BEST_TO_STATUS (Score: $BEST_SCORE)"
           
-          # Add PR link in comment
-          PR_URL="${{ github.event.pull_request.html_url }}"
-          COMMENT_DATA="{
-            \"body\": {
-              \"type\": \"doc\",
-              \"version\": 1,
-              \"content\": [
-                {
-                  \"type\": \"paragraph\",
-                  \"content\": [
-                    {
-                      \"type\": \"text\",
-                      \"text\": \"PR was merged: ${PR_URL}\"
-                    }
-                  ]
-                }
-              ]
-            }
-          }"
-          
-          # Add comment
-          echo "Adding comment with PR link..."
-          curl -s -X POST \
+          # Check if we need to handle resolution when transitioning
+          NEEDS_RESOLUTION=$(curl -s -X POST \
             -H "Authorization: Basic ${AUTH}" \
             -H "Content-Type: application/json" \
-            --data "$COMMENT_DATA" \
-            "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/comment"
+            --data "{\"transition\":{\"id\":\"${BEST_TRANSITION_ID}\"}}" \
+            "${TRANSITIONS_URL}" | jq -r '.errorMessages[0] // ""')
           
-          # Check if resolution field is required for this transition
-          REQUIRES_RESOLUTION=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.id == \"$TRANSITION_ID\") | .fields.resolution")
-          
-          if [[ "$REQUIRES_RESOLUTION" != "null" && -n "$REQUIRES_RESOLUTION" ]]; then
-            echo "This transition requires a resolution field"
-            
-            # Find available resolutions
-            RESOLUTIONS=$(echo "$TRANSITIONS" | jq -r ".transitions[] | select(.id == \"$TRANSITION_ID\") | .fields.resolution.allowedValues")
-            
-            if [[ -n "$RESOLUTIONS" && "$RESOLUTIONS" != "null" ]]; then
-              # Find a suitable resolution (prefer "Done" or "Fixed")
-              RESOLUTION_ID=$(echo "$RESOLUTIONS" | jq -r '.[] | select(.name == "Done" or .name == "Fixed") | .id' | head -1)
-              
-              if [[ -z "$RESOLUTION_ID" ]]; then
-                # Use first available resolution
-                RESOLUTION_ID=$(echo "$RESOLUTIONS" | jq -r '.[0].id')
-              fi
-              
-              if [[ -n "$RESOLUTION_ID" ]]; then
-                echo "Setting resolution ID: $RESOLUTION_ID"
-                
-                # Perform transition with resolution
-                TRANSITION_DATA="{
-                  \"transition\": {
-                    \"id\": \"${TRANSITION_ID}\"
-                  },
-                  \"fields\": {
-                    \"resolution\": {
-                      \"id\": \"${RESOLUTION_ID}\"
-                    }
-                  }
-                }"
-                
-                # Perform transition with resolution
-                echo "Performing transition with resolution..."
-                curl -s -X POST \
-                  -H "Authorization: Basic ${AUTH}" \
-                  -H "Content-Type: application/json" \
-                  --data "$TRANSITION_DATA" \
-                  "${TRANSITIONS_URL}"
-              else
-                echo "No resolution ID found, trying transition without resolution"
-                # Perform simple transition
-                curl -s -X POST \
-                  -H "Authorization: Basic ${AUTH}" \
-                  -H "Content-Type: application/json" \
-                  --data "{\"transition\":{\"id\":\"${TRANSITION_ID}\"}}" \
-                  "${TRANSITIONS_URL}"
-              fi
-            else
-              echo "No resolution values found, trying transition without resolution"
-              # Perform simple transition
-              curl -s -X POST \
-                -H "Authorization: Basic ${AUTH}" \
-                -H "Content-Type: application/json" \
-                --data "{\"transition\":{\"id\":\"${TRANSITION_ID}\"}}" \
-                "${TRANSITIONS_URL}"
-            fi
+          # If it mentions resolution is required
+          if [[ "$NEEDS_RESOLUTION" == *"resolution"* ]]; then
+            echo "Resolution required for this transition"
+            curl -s -X POST \
+              -H "Authorization: Basic ${AUTH}" \
+              -H "Content-Type: application/json" \
+              --data "{\"transition\":{\"id\":\"${BEST_TRANSITION_ID}\"},\"fields\":{\"resolution\":{\"name\":\"Done\"}}}" \
+              "${TRANSITIONS_URL}"
           else
             echo "No resolution required, performing simple transition"
             # Perform simple transition
             curl -s -X POST \
               -H "Authorization: Basic ${AUTH}" \
               -H "Content-Type: application/json" \
-              --data "{\"transition\":{\"id\":\"${TRANSITION_ID}\"}}" \
+              --data "{\"transition\":{\"id\":\"${BEST_TRANSITION_ID}\"}}" \
               "${TRANSITIONS_URL}"
           fi
           
@@ -487,3 +361,62 @@ runs:
         else
           echo "❌ No valid transitions are available for this issue"
         fi
+    
+    - name: Add PR Link to Jira Issue
+      if: env.JIRA_ISSUE_FOUND == 'true' && github.event.pull_request.merged == true
+      shell: bash
+      run: |
+        JIRA_BASE_URL="${{ inputs.jira-base-url }}"
+        JIRA_EMAIL="${{ inputs.jira-user-email }}"
+        JIRA_TOKEN="${{ inputs.jira-api-token }}"
+        PR_URL="${{ github.event.pull_request.html_url }}"
+        PR_TITLE="${{ github.event.pull_request.title }}"
+        
+        # Basic auth
+        AUTH=$(echo -n "${JIRA_EMAIL}:${JIRA_TOKEN}" | base64)
+        
+        echo "Adding PR link to Jira issue ${JIRA_ISSUE}..."
+        
+        # Add comment with PR link
+        COMMENT_URL="${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE}/comment"
+        
+        curl -s -X POST \
+          -H "Authorization: Basic ${AUTH}" \
+          -H "Content-Type: application/json" \
+          --data "{
+            \"body\": {
+              \"type\": \"doc\",
+              \"version\": 1,
+              \"content\": [
+                {
+                  \"type\": \"paragraph\",
+                  \"content\": [
+                    {
+                      \"text\": \"PR merged: $PR_TITLE\",
+                      \"type\": \"text\"
+                    }
+                  ]
+                },
+                {
+                  \"type\": \"paragraph\",
+                  \"content\": [
+                    {
+                      \"text\": \"$PR_URL\",
+                      \"type\": \"text\",
+                      \"marks\": [
+                        {
+                          \"type\": \"link\",
+                          \"attrs\": {
+                            \"href\": \"$PR_URL\"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }" \
+          "${COMMENT_URL}"
+        
+        echo "Comment added to Jira issue with PR link"
